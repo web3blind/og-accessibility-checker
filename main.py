@@ -131,9 +131,11 @@ async def run_analysis(html_content: str, url: Optional[str] = None) -> dict:
 
     response = await client.chat(
         model=og.TEE_LLM.CLAUDE_HAIKU_4_5,
-        messages=[{"role": "user", "content": user_msg}],
+        messages=[
+            {"role": "system", "content": WCAG_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
         max_tokens=2000,
-        system=WCAG_SYSTEM_PROMPT,
     )
 
     return response
