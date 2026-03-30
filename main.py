@@ -92,7 +92,7 @@ class AccessibilityReport(BaseModel):
 
 
 async def fetch_html(url: str) -> str:
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, verify=False) as client:
         headers = {"User-Agent": "Mozilla/5.0 OG-Accessibility-Checker/1.0"}
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
