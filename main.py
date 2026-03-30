@@ -28,7 +28,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PRIVATE_KEY = os.environ.get("OG_PRIVATE_KEY", "")
+_raw_key = os.environ.get("OG_PRIVATE_KEY", "").strip()
+# Normalize: ensure 0x prefix
+if _raw_key and not _raw_key.startswith("0x"):
+    _raw_key = "0x" + _raw_key
+PRIVATE_KEY = _raw_key
+
 llm_client: Optional[og.LLM] = None
 
 
@@ -193,6 +198,18 @@ async def process_analysis(html_content: str, url: Optional[str]) -> Accessibili
             "network": "Base Sepolia",
         },
     )
+
+
+@app.get("/debug/env")
+async def debug_env():
+    """Temporary: check env variable state."""
+    raw = os.environ.get("OG_PRIVATE_KEY", "NOT_SET")
+    return {
+        "raw_len": len(raw),
+        "has_0x": raw.startswith("0x"),
+        "first_4": raw[:4] if len(raw) >= 4 else raw,
+        "PRIVATE_KEY_len": len(PRIVATE_KEY),
+    }
 
 
 @app.get("/health")
