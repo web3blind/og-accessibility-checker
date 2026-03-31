@@ -116,6 +116,7 @@ Be concise. Only report what you can actually see in the HTML."""
 class AnalyzeUrlRequest(BaseModel):
     url: str
     max_html_chars: int = 8000
+    use_playwright: bool = False  # Set True to render JS before analysis (requires local Chromium)
 
 
 class AnalyzeHtmlRequest(BaseModel):
@@ -133,6 +134,7 @@ class AccessibilityReport(BaseModel):
     manual_checks: list
     recommendations: list
     proof: dict
+    rendered: bool = False  # True if HTML was fetched via Playwright (JS rendered)
 
 
 async def fetch_html(url: str) -> str:
@@ -143,22 +145,98 @@ async def fetch_html(url: str) -> str:
         return resp.text
 
 
+async def fetch_html_rendered(url: str, timeout: int = 45) -> str:
+    """Fetch fully rendered HTML via headless Chromium (Playwright).
+    Requires playwright + chromium installed locally.
+    Falls back to plain httpx fetch if playwright is unavailable.
+    """
+    import asyncio
+    import subprocess
+    import sys
+
+    # Try to find playwright-capable python — auditor venv or current interpreter
+    candidates = [
+        os.path.expanduser("~/.hermes/agents/accessibility-auditor/venv/bin/python3"),
+        sys.executable,
+    ]
+    fetch_script = os.path.expanduser(
+        "~/.hermes/agents/accessibility-auditor/fetch_page.py"
+    )
+
+    python_bin = None
+    if os.path.exists(fetch_script):
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                python_bin = candidate
+                break
+
+    if not python_bin:
+        # Playwright not available — fall back to httpx
+        return await fetch_html(url)
+
+    loop = asyncio.get_event_loop()
+    try:
+        proc = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [python_bin, fetch_script, url, str(timeout)],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout + 20,
+                ),
+            ),
+            timeout=timeout + 25,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+        # Playwright failed — fall back to httpx
+        return await fetch_html(url)
+    except Exception:
+        return await fetch_html(url)
+
+
 def extract_relevant_html(html: str, max_chars: int = 8000) -> str:
-    """Extract key accessibility-relevant HTML, truncate if needed."""
+    """Extract key accessibility-relevant HTML, truncate if needed.
+
+    Preserves <html lang=...> and <head> metadata (title, meta) since they
+    contain critical WCAG signals (3.1.1 lang, 2.4.2 title, etc.).
+    Removes scripts/styles/SVGs to save tokens.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove scripts, styles, comments to save tokens
-    for tag in soup(["script", "style", "noscript"]):
+    # Remove noise
+    for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
 
-    # Get body or full doc
+    # Build compact head — only accessibility-relevant tags
+    head_parts = []
+    html_tag = soup.find("html")
+    lang = html_tag.get("lang", "") if html_tag else ""
+    head_parts.append(f'<html lang="{lang}">' if lang else "<html>")
+
+    head = soup.find("head")
+    if head:
+        title = head.find("title")
+        if title:
+            head_parts.append(str(title))
+        for meta in head.find_all("meta"):
+            name = meta.get("name", "") or meta.get("property", "")
+            if name in ("description", "robots", "viewport"):
+                head_parts.append(str(meta))
+    head_parts.append("</head>")
+
+    # Body content
     body = soup.find("body") or soup
-    cleaned = str(body)
+    body_str = str(body)
 
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars] + "\n<!-- [truncated for analysis] -->"
+    # Budget: head always fits, trim body to remaining budget
+    head_str = "\n".join(head_parts)
+    body_budget = max_chars - len(head_str) - 50
+    if len(body_str) > body_budget:
+        body_str = body_str[:body_budget] + "\n<!-- [truncated for analysis] -->"
 
-    return cleaned
+    return head_str + "\n" + body_str
 
 
 async def run_analysis(html_content: str, url: Optional[str] = None) -> dict:
@@ -182,14 +260,21 @@ async def run_analysis(html_content: str, url: Optional[str] = None) -> dict:
 
 @app.post("/analyze/url", response_model=AccessibilityReport)
 async def analyze_url(request: AnalyzeUrlRequest):
-    """Fetch a URL and analyze its HTML for WCAG 2.1 accessibility issues."""
+    """Fetch a URL and analyze its HTML for WCAG 2.1 accessibility issues.
+
+    Set use_playwright=true to render JavaScript before analysis (local only).
+    Falls back to plain HTTP fetch if Playwright/Chromium is unavailable.
+    """
     try:
-        raw_html = await fetch_html(request.url)
+        if request.use_playwright:
+            raw_html = await fetch_html_rendered(request.url)
+        else:
+            raw_html = await fetch_html(request.url)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
 
     html_content = extract_relevant_html(raw_html, request.max_html_chars)
-    return await process_analysis(html_content, request.url)
+    return await process_analysis(html_content, request.url, rendered=request.use_playwright)
 
 
 @app.post("/analyze/html", response_model=AccessibilityReport)
@@ -199,7 +284,7 @@ async def analyze_html(request: AnalyzeHtmlRequest):
     return await process_analysis(html_content, request.url)
 
 
-async def process_analysis(html_content: str, url: Optional[str]) -> AccessibilityReport:
+async def process_analysis(html_content: str, url: Optional[str], rendered: bool = False) -> AccessibilityReport:
     try:
         response = await run_analysis(html_content, url)
     except Exception as e:
@@ -211,15 +296,39 @@ async def process_analysis(html_content: str, url: Optional[str]) -> Accessibili
 
     raw_text = response.chat_output.get("content", "") if response.chat_output else ""
 
-    # Extract JSON block from response
+    # Extract JSON block from response — try full match first, then repair
     json_match = re.search(r"\{[\s\S]*\}", raw_text)
     if not json_match:
         raise HTTPException(status_code=502, detail="Invalid response format from LLM")
 
+    json_str = json_match.group()
+    analysis = None
+
+    # Attempt 1: direct parse
     try:
-        analysis = json.loads(json_match.group())
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"JSON parse error: {e}")
+        analysis = json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: find last complete top-level closing brace
+    if analysis is None:
+        depth = 0
+        last_valid_end = 0
+        for i, ch in enumerate(json_str):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    last_valid_end = i + 1
+        if last_valid_end:
+            try:
+                analysis = json.loads(json_str[:last_valid_end])
+            except json.JSONDecodeError:
+                pass
+
+    if analysis is None:
+        raise HTTPException(status_code=502, detail="Could not parse LLM JSON response")
 
     return AccessibilityReport(
         url=url,
@@ -230,6 +339,7 @@ async def process_analysis(html_content: str, url: Optional[str]) -> Accessibili
         passed=analysis.get("passed", []),
         manual_checks=analysis.get("manual_checks", []),
         recommendations=analysis.get("recommendations", []),
+        rendered=rendered,
         proof={
             "transaction_hash": response.transaction_hash,
             "payment_hash": response.payment_hash,
@@ -238,6 +348,7 @@ async def process_analysis(html_content: str, url: Optional[str]) -> Accessibili
             "tee_id": response.tee_id,
             "model": str(og.TEE_LLM.CLAUDE_HAIKU_4_5),
             "network": "Base Sepolia",
+            "fetch_mode": "playwright" if rendered else "httpx",
         },
     )
 
