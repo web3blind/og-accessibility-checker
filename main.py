@@ -116,7 +116,7 @@ Be concise. Only report what you can actually see in the HTML."""
 class AnalyzeUrlRequest(BaseModel):
     url: str
     max_html_chars: int = 8000
-    use_playwright: bool = False  # Set True to render JS before analysis (requires local Chromium)
+    use_playwright: bool = True  # Render JS via headless Chromium before analysis; falls back to httpx if unavailable
 
 
 class AnalyzeHtmlRequest(BaseModel):
