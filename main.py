@@ -135,6 +135,7 @@ class AccessibilityReport(BaseModel):
     recommendations: list
     proof: dict
     rendered: bool = False  # True if HTML was fetched via Playwright (JS rendered)
+    fetch_mode: str = "httpx"  # "playwright" or "httpx" — indicates completeness of HTML analysis
 
 
 async def fetch_html(url: str) -> str:
@@ -330,6 +331,7 @@ async def process_analysis(html_content: str, url: Optional[str], rendered: bool
     if analysis is None:
         raise HTTPException(status_code=502, detail="Could not parse LLM JSON response")
 
+    mode = "playwright" if rendered else "httpx"
     return AccessibilityReport(
         url=url,
         score=analysis.get("score", 0),
@@ -340,6 +342,7 @@ async def process_analysis(html_content: str, url: Optional[str], rendered: bool
         manual_checks=analysis.get("manual_checks", []),
         recommendations=analysis.get("recommendations", []),
         rendered=rendered,
+        fetch_mode=mode,
         proof={
             "transaction_hash": response.transaction_hash,
             "payment_hash": response.payment_hash,
@@ -348,7 +351,7 @@ async def process_analysis(html_content: str, url: Optional[str], rendered: bool
             "tee_id": response.tee_id,
             "model": str(og.TEE_LLM.CLAUDE_HAIKU_4_5),
             "network": "Base Sepolia",
-            "fetch_mode": "playwright" if rendered else "httpx",
+            "fetch_mode": mode,
         },
     )
 
