@@ -202,6 +202,36 @@ async def process_analysis(html_content: str, url: Optional[str]) -> Accessibili
     )
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Ensure OPG Permit2 allowance matches current balance on server start."""
+    if not PRIVATE_KEY:
+        return
+    try:
+        from web3 import Web3
+        from eth_account import Account
+        from opengradient.client.opg_token import BASE_SEPOLIA_RPC, BASE_OPG_ADDRESS
+        import logging
+
+        w3 = Web3(Web3.HTTPProvider(BASE_SEPOLIA_RPC))
+        addr = Account.from_key(PRIVATE_KEY).address
+        ABI = [{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf",
+                "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+        c = w3.eth.contract(address=Web3.to_checksum_address(BASE_OPG_ADDRESS), abi=ABI)
+        bal = c.functions.balanceOf(addr).call()
+        bal_float = bal / 1e18
+
+        if bal_float >= 0.1:
+            client = get_llm()
+            client.ensure_opg_approval(min_allowance=bal_float - 0.001, approve_amount=bal_float)
+            logging.info(f"OPG Permit2 approval set to {bal_float} OPG")
+        else:
+            logging.warning(f"OPG balance too low: {bal_float} OPG (need >= 0.1)")
+    except Exception as e:
+        import logging
+        logging.warning(f"OPG approval startup check failed: {e}")
+
+
 @app.get("/debug/env")
 async def debug_env():
     """Temporary: check env variable state."""
