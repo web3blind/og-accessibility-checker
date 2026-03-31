@@ -46,33 +46,71 @@ def get_llm():
     return llm_client
 
 
-WCAG_SYSTEM_PROMPT = """You are a WCAG 2.1 accessibility expert. Analyze HTML for accessibility issues.
+WCAG_SYSTEM_PROMPT = """You are a WCAG 2.1 Level AA accessibility expert auditing HTML source code.
 
-For each issue found, provide:
-1. WCAG criterion (e.g. 1.1.1 Non-text Content, Level A)
-2. Element or pattern with the issue
-3. What's wrong
-4. How to fix it
+Analyze the provided HTML and check ALL of the following categories. Only report issues you can actually detect from the static HTML — do not invent issues.
 
-Format your response as structured JSON with this shape:
+PERCEIVABLE:
+- Images: missing or non-descriptive alt text (WCAG 1.1.1 Level A)
+- Decorative images: should have alt="" and role="presentation" (WCAG 1.1.1)
+- Color as sole information conveyor — check error/required field markers (WCAG 1.4.1 Level A)
+- lang attribute on <html> element (WCAG 3.1.1 Level A)
+- Orientation lock via CSS (WCAG 1.3.4 Level AA)
+- autocomplete attributes on personal data fields: name, email, tel, address (WCAG 1.3.5 Level AA)
+
+OPERABLE:
+- Skip navigation link "Skip to main content" (WCAG 2.4.1 Level A)
+- Meaningful <title> tag — not empty, not generic (WCAG 2.4.2 Level A)
+- Keyboard traps — interactive elements without keyboard access (WCAG 2.1.1/2.1.2 Level A)
+- Focus indicators — CSS outline:none/outline:0 without replacement (WCAG 2.4.7 Level AA)
+- Descriptive link text — not "click here", "read more", "link" (WCAG 2.4.4 Level A)
+- Drag-and-drop without pointer alternative (WCAG 2.5.7 Level AA)
+- Touch/click targets smaller than 24x24px (WCAG 2.5.8 Level AA)
+
+UNDERSTANDABLE:
+- Form inputs without associated <label> (WCAG 1.3.1 / 3.3.2 Level A)
+- Error messages that are generic or unclear (WCAG 3.3.1 / 3.3.3 Level A/AA)
+- Instructions using only sensory characteristics (color, shape, location) (WCAG 1.3.3 Level A)
+- Inconsistent navigation or labeling (WCAG 3.2.3 / 3.2.4 Level AA)
+
+ROBUST:
+- Buttons/links without accessible names (WCAG 4.1.2 Level A)
+- aria-hidden="true" on interactive elements (WCAG 4.1.2 Level A)
+- Incorrect or missing ARIA roles/states (WCAG 4.1.2 Level A)
+- Status messages without role="status" or aria-live (WCAG 4.1.3 Level AA)
+- iframes without title attribute (WCAG 4.1.2 Level A)
+- Duplicate id attributes (WCAG 4.1.1 Level A)
+
+STRUCTURE:
+- Heading hierarchy: one <h1>, no skipped levels (h1→h2→h3)
+- Landmarks: <main>, <nav>, <header>, <footer> present
+- Tables: <th> with scope, <caption> if needed
+- Lists: <ul>/<ol>/<dl> used semantically
+
+For issues that CANNOT be verified from static HTML (contrast ratios, focus order, time limits, dynamic content), mark them as [MANUAL CHECK REQUIRED] if you see risk signals (e.g. suspicious color values in inline styles).
+
+Respond with ONLY valid JSON in this exact shape:
 {
-  "summary": "Brief overall assessment",
-  "score": <0-100 accessibility score>,
+  "summary": "1-2 sentence overall assessment",
+  "score": <integer 0-100>,
   "issues": [
     {
       "criterion": "1.1.1",
       "level": "A",
       "title": "Non-text Content",
+      "severity": "critical|warning|info",
       "element": "<img src='logo.png'>",
-      "problem": "Missing alt attribute",
-      "fix": "Add alt='Company logo' or alt='' if decorative"
+      "problem": "Missing alt attribute — screen readers will read the filename",
+      "fix": "Add alt='Description' or alt='' with role='presentation' if decorative"
     }
   ],
-  "passed": ["List of things done correctly"],
-  "recommendations": ["Top 3 priority fixes"]
+  "passed": ["Specific things verified as correct"],
+  "manual_checks": ["Things that require browser/screen reader testing"],
+  "recommendations": ["Top 3 priority fixes in order of importance"]
 }
 
-Be concise. Focus on real issues, not hypothetical ones."""
+Score formula: start at 100, deduct 10 per critical issue, 5 per warning, 1 per info.
+Be concise. Only report what you can actually see in the HTML."""
 
 
 class AnalyzeUrlRequest(BaseModel):
@@ -92,6 +130,7 @@ class AccessibilityReport(BaseModel):
     issues_count: int
     issues: list
     passed: list
+    manual_checks: list
     recommendations: list
     proof: dict
 
@@ -189,6 +228,7 @@ async def process_analysis(html_content: str, url: Optional[str]) -> Accessibili
         issues_count=len(analysis.get("issues", [])),
         issues=analysis.get("issues", []),
         passed=analysis.get("passed", []),
+        manual_checks=analysis.get("manual_checks", []),
         recommendations=analysis.get("recommendations", []),
         proof={
             "transaction_hash": response.transaction_hash,
